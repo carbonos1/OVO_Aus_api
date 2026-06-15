@@ -82,6 +82,24 @@ async def async_setup_entry(
     # ── Plan comparison / recommendation ──
     sensors.append(OVORateComparisonSensor(coordinator))
 
+    # ── Real bills + last-3-days + payments + referral (rich attributes) ──
+    sensors.append(OVOLatestBillSensor(coordinator))
+    sensors.append(OVOLast3DaysSensor(coordinator))
+    sensors.append(OVOLatestPaymentSensor(coordinator))
+    sensors.append(OVOReferralSensor(coordinator))
+    sensors.append(OVOFlexSensor(coordinator))
+
+    # ── HA Energy Dashboard (cumulative month-to-date, total + last_reset) ──
+    sensors.append(OVOEnergyDashboardSensor(
+        coordinator, "energy_grid_import", "Grid Import (Energy Dashboard)",
+        "grid_consumption", "mdi:transmission-tower-import"))
+    sensors.append(OVOEnergyDashboardSensor(
+        coordinator, "energy_grid_export", "Grid Export (Energy Dashboard)",
+        "return_to_grid", "mdi:transmission-tower-export"))
+    sensors.append(OVOEnergyDashboardSensor(
+        coordinator, "energy_solar_production", "Solar Production (Energy Dashboard)",
+        "solar_consumption", "mdi:solar-power"))
+
     async_add_entities(sensors)
 
 
@@ -155,18 +173,21 @@ def _add_dynamic_day_sensors(sensors: list, coordinator) -> None:
                 unit, dc, sc, icon, idx, key,
             ))
 
-        # Per-rate breakdown for this day
-        for rate_type in RATE_TYPES:
+        # Per-rate breakdown for this day. key_suffix preserves historical
+        # unique_ids (e.g. OFF_PEAK -> "offpeak") while rate_type matches
+        # the API charge type used in the data lookup. Names include the day
+        # number so slugification produces distinct entity_ids.
+        for rate_type, key_suffix in RATE_TYPES.items():
             rate_label = rate_type.replace("_", " ").title()
             sensors.append(OVODayRateSensor(
-                coordinator, f"day_{day_num}_grid_rate_{rate_type.lower()}_consumption",
+                coordinator, f"day_{day_num}_grid_rate_{key_suffix}_consumption",
                 f"Day {day_num} {rate_label} Consumption",
                 UnitOfEnergy.KILO_WATT_HOUR, SensorDeviceClass.ENERGY, SensorStateClass.TOTAL,
                 RATE_TYPE_ICONS.get(rate_type, "mdi:flash"), idx, rate_type, "grid_rates_kwh",
             ))
             is_free = rate_type == "FREE_3"
             sensors.append(OVODayRateSensor(
-                coordinator, f"day_{day_num}_grid_rate_{rate_type.lower()}_charge",
+                coordinator, f"day_{day_num}_grid_rate_{key_suffix}_charge",
                 f"Day {day_num} {rate_label} {'Savings' if is_free else 'Cost'}",
                 "AUD", SensorDeviceClass.MONETARY, SensorStateClass.TOTAL,
                 "mdi:piggy-bank" if is_free else "mdi:currency-usd",
@@ -394,6 +415,7 @@ class OVODayRateSensor(OVOBaseSensor):
         for day in self.coordinator.data.get("all_daily_entries", []):
             if day.get("date") == target:
                 return day
+        # No history for this day yet — unavailable, not a real 0
         return None
 
     @property
@@ -776,11 +798,12 @@ class OVORateComparisonSensor(OVOBaseSensor):
             attrs["recommendation"] = "You may save more on a different plan. Contact OVO to compare options."
             attrs["rating"] = "Consider Switching"
 
-        # Project annual savings from monthly
+        # Project annual savings from monthly. Skip the first few days of a
+        # month — extrapolating 1-2 days of data to a year is wildly unstable.
         if monthly_savings > 0:
             now = datetime.now(AU_TIMEZONE)
             day_of_month = now.day
-            if day_of_month > 0:
+            if day_of_month >= 3:
                 projected_monthly = monthly_savings / day_of_month * 30.44
                 projected_annual = projected_monthly * 12
                 attrs["projected_annual_savings"] = round(projected_annual, 2)
@@ -853,5 +876,200 @@ class OVOHourlyDaySensor(OVOBaseSensor):
             "hourly_values": result["hourly_data"],
             "data_points": len(result["hourly_data"]),
         }
+
+
+class OVOLatestBillSensor(OVOBaseSensor):
+    """Most recent issued bill — amount as state, period/balances/PDF in attributes."""
+
+    def __init__(self, coordinator):
+        super().__init__(coordinator, "latest_bill", "Latest Bill", "Bills")
+        self._attr_icon = "mdi:receipt-text"
+        self._attr_native_unit_of_measurement = "AUD"
+        self._attr_device_class = SensorDeviceClass.MONETARY
+
+    @property
+    def native_value(self) -> float | None:
+        if not self.coordinator.data:
+            return None
+        total = (self.coordinator.data.get("latest_bill") or {}).get("total")
+        return round(float(total), 2) if total is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        if not self.coordinator.data:
+            return {}
+        bill = self.coordinator.data.get("latest_bill") or {}
+        statements = self.coordinator.data.get("statements") or []
+        return {
+            "period_from": bill.get("period_from"),
+            "period_to": bill.get("period_to"),
+            "issue_date": bill.get("issue_date"),
+            "opening_balance": bill.get("opening_balance"),
+            "closing_balance": bill.get("closing_balance"),
+            "download_url": bill.get("download_url"),
+            "statement_count": len(statements),
+            "recent_bills": [
+                {
+                    "period_from": s.get("periodFrom"),
+                    "period_to": s.get("periodTo"),
+                    "issue_date": s.get("issueDate"),
+                    "total": ((s.get("charges") or {}).get("total") or {}).get("value"),
+                    "closing_balance": (s.get("closingBalance") or {}).get("value"),
+                    "download_url": s.get("downloadUrl"),
+                }
+                for s in statements[:12]
+            ],
+        }
+
+
+class OVOLast3DaysSensor(OVOBaseSensor):
+    """Last 3 days of grid usage — total kWh as state, per-day detail in attributes.
+
+    Surfaces coordinator.data["last_3_days"], which was computed every refresh but
+    previously had no entity (orphan analytics, same class as #74).
+    """
+
+    def __init__(self, coordinator):
+        super().__init__(
+            coordinator, "last_3_days_grid", "Grid Consumption (Last 3 Days)", "Last 3 Days"
+        )
+        self._attr_icon = "mdi:calendar-range"
+        self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+        self._attr_device_class = SensorDeviceClass.ENERGY
+
+    @property
+    def native_value(self) -> float | None:
+        if not self.coordinator.data:
+            return None
+        days = self.coordinator.data.get("last_3_days") or []
+        if not days:
+            return None
+        return round(sum(d.get("grid_consumption", 0) or 0 for d in days), 2)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        if not self.coordinator.data:
+            return {}
+        days = self.coordinator.data.get("last_3_days") or []
+        return {"days": days, "day_count": len(days)}
+
+
+class OVOEnergyDashboardSensor(OVOBaseSensor):
+    """Cumulative month-to-date energy sensor for HA's built-in Energy Dashboard (#73).
+
+    OVO exposes period totals, not a raw meter reading, so this uses
+    state_class=TOTAL with last_reset at the start of the current month — the
+    pattern Home Assistant expects for period-based sources. The monthly
+    grid/export/solar aggregate accumulates through the month and resets on the
+    1st (signalled via last_reset), so the Energy Dashboard derives correct
+    daily and monthly figures. Add these under Settings -> Energy.
+    """
+
+    def __init__(self, coordinator, key, name, data_key, icon):
+        super().__init__(coordinator, key, name, "Energy Dashboard")
+        self._data_key = data_key
+        self._icon = icon
+        self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+        self._attr_device_class = SensorDeviceClass.ENERGY
+        self._attr_state_class = SensorStateClass.TOTAL
+
+    @property
+    def icon(self) -> str:
+        return self._icon
+
+    @property
+    def native_value(self) -> float | None:
+        if not self.coordinator.data:
+            return None
+        val = (self.coordinator.data.get("monthly") or {}).get(self._data_key)
+        return round(float(val), 3) if val is not None else None
+
+    @property
+    def last_reset(self) -> datetime:
+        """Start of the current month (AEST) — when the monthly total reset."""
+        now = datetime.now(AU_TIMEZONE)
+        return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+class OVOLatestPaymentSensor(OVOBaseSensor):
+    """Most recent payment — amount as state, date/type/history in attributes."""
+
+    def __init__(self, coordinator):
+        super().__init__(coordinator, "latest_payment", "Latest Payment", "Payments")
+        self._attr_icon = "mdi:cash-register"
+        self._attr_native_unit_of_measurement = "AUD"
+        self._attr_device_class = SensorDeviceClass.MONETARY
+
+    @property
+    def native_value(self) -> float | None:
+        if not self.coordinator.data:
+            return None
+        amt = (self.coordinator.data.get("latest_payment") or {}).get("amount")
+        return round(float(amt), 2) if amt is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        if not self.coordinator.data:
+            return {}
+        lp = self.coordinator.data.get("latest_payment") or {}
+        payments = self.coordinator.data.get("payments") or []
+        return {
+            "date": lp.get("date"),
+            "payment_type": lp.get("type"),
+            "payment_count": len(payments),
+            "recent_payments": payments[:12],
+        }
+
+
+class OVOReferralSensor(OVOBaseSensor):
+    """Refer-a-friend earnings — total earned as state, code/count in attributes."""
+
+    def __init__(self, coordinator):
+        super().__init__(coordinator, "referral_earnings", "Referral Earnings", "Referrals")
+        self._attr_icon = "mdi:account-multiple-plus"
+        self._attr_native_unit_of_measurement = "AUD"
+        self._attr_device_class = SensorDeviceClass.MONETARY
+
+    @property
+    def native_value(self) -> float | None:
+        if not self.coordinator.data:
+            return None
+        earned = (self.coordinator.data.get("referral") or {}).get("total_earned")
+        return round(float(earned), 2) if earned is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        if not self.coordinator.data:
+            return {}
+        ref = self.coordinator.data.get("referral") or {}
+        return {
+            "referral_code": ref.get("code"),
+            "referrals": ref.get("referral_count"),
+        }
+
+
+class OVOFlexSensor(OVOBaseSensor):
+    """OVO Flex onboarding status (diagnostic).
+
+    The OVO API's `flex` object exposes a single field, `hasOnboarded` — there is
+    no balance/credits/VPP data in the API (confirmed by scanning the web app's
+    GraphQL operations). GetNotificationInfo is intentionally not surfaced: its
+    input requires an `fcmToken` (a mobile push token) that an HA integration
+    does not have.
+    """
+
+    def __init__(self, coordinator):
+        super().__init__(coordinator, "flex_onboarded", "OVO Flex Onboarded", "General")
+        self._attr_icon = "mdi:account-star"
+        self._attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    @property
+    def native_value(self) -> str | None:
+        if not self.coordinator.data:
+            return None
+        onboarded = (self.coordinator.data.get("flex") or {}).get("onboarded")
+        if onboarded is None:
+            return None
+        return "Onboarded" if onboarded else "Not Onboarded"
 
 

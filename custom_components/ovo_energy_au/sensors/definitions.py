@@ -133,8 +133,25 @@ ANALYTICS_SENSORS = [
     # Peak Usage
     ("peak_4hour_consumption", "Peak 4-Hour Consumption", UnitOfEnergy.KILO_WATT_HOUR,
      SensorDeviceClass.ENERGY, None, "mdi:chart-bell-curve",
-     lambda d: (p := d.get("hourly", {}).get("peak_4hour_window")) and p.get("total_consumption"),
+     lambda d: (d.get("hourly", {}).get("peak_4hour_window") or {}).get("total_consumption"),
      "Peak Usage"),
+
+    # Time of Use (peak/off-peak split). Surfaces the Free 3 window split that
+    # analytics.hourly._split_other_by_window computes from hourly GRID
+    # consumption (#63/#74). CONSUMPTION ONLY: the OVO hourly API returns no
+    # per-hour cost/rate data (charge/rates are null), so peak/off-peak COST
+    # cannot be derived (it would always be 0) — only the kWh split is real.
+    # Populates for Free 3 plans once the peak window is configured; 0 for plans
+    # without a configured window.
+    ("tou_peak_consumption", "Peak Consumption (Last 7 Days)", UnitOfEnergy.KILO_WATT_HOUR,
+     SensorDeviceClass.ENERGY, None, "mdi:arrow-up-bold",
+     lambda d: d.get("hourly", {}).get("time_of_use", {}).get("peak", {}).get("consumption"),
+     "Time of Use"),
+
+    ("tou_off_peak_consumption", "Off-Peak Consumption (Last 7 Days)", UnitOfEnergy.KILO_WATT_HOUR,
+     SensorDeviceClass.ENERGY, None, "mdi:arrow-down-bold",
+     lambda d: d.get("hourly", {}).get("time_of_use", {}).get("off_peak", {}).get("consumption"),
+     "Time of Use"),
 
     # Week Comparison
     ("week_comparison_solar", "Solar Consumption (This Week)", UnitOfEnergy.KILO_WATT_HOUR,
@@ -289,8 +306,10 @@ ANALYTICS_SENSORS = [
      lambda d: d.get("yearly", {}).get("ovo_savings"), "OVO Savings"),
 
     # EV Charging Tracker
+    # TOTAL_INCREASING: the value is a month-to-date running sum that resets
+    # at month rollover — plain TOTAL would record the reset as a negative delta
     ("monthly_ev_charging_kwh", "EV Charging This Month", UnitOfEnergy.KILO_WATT_HOUR,
-     SensorDeviceClass.ENERGY, SensorStateClass.TOTAL, "mdi:ev-station",
+     SensorDeviceClass.ENERGY, SensorStateClass.TOTAL_INCREASING, "mdi:ev-station",
      lambda d: d.get("monthly", {}).get("rate_breakdown", {}).get("EV_OFFPEAK", {}).get("consumption"),
      "EV Charging"),
 
@@ -300,7 +319,7 @@ ANALYTICS_SENSORS = [
      "EV Charging"),
 
     ("yearly_ev_charging_kwh", "EV Charging This Year", UnitOfEnergy.KILO_WATT_HOUR,
-     SensorDeviceClass.ENERGY, SensorStateClass.TOTAL, "mdi:ev-station",
+     SensorDeviceClass.ENERGY, SensorStateClass.TOTAL_INCREASING, "mdi:ev-station",
      lambda d: d.get("yearly", {}).get("rate_breakdown", {}).get("EV_OFFPEAK", {}).get("consumption"),
      "EV Charging"),
 
@@ -325,19 +344,96 @@ ANALYTICS_SENSORS = [
     ("bill_daily_average", "Daily Average Net Cost", "AUD",
      SensorDeviceClass.MONETARY, None, "mdi:calendar-today",
      lambda d: d.get("bill_estimate", {}).get("daily_average_net"), "Bill Estimate"),
+
+    # Real Bills (actual issued statements from the API — supersedes estimates)
+    ("latest_bill_amount", "Latest Bill Amount", "AUD",
+     SensorDeviceClass.MONETARY, None, "mdi:receipt-text-check",
+     lambda d: d.get("latest_bill", {}).get("total"), "Bills"),
+
+    ("latest_bill_closing_balance", "Latest Statement Closing Balance", "AUD",
+     SensorDeviceClass.MONETARY, None, "mdi:scale-balance",
+     lambda d: d.get("latest_bill", {}).get("closing_balance"), "Bills"),
+
+    ("latest_bill_opening_balance", "Latest Statement Opening Balance", "AUD",
+     SensorDeviceClass.MONETARY, None, "mdi:scale-balance",
+     lambda d: d.get("latest_bill", {}).get("opening_balance"), "Bills"),
+
+    # Real plan rates auto-detected from the API (productAgreements). Cents are
+    # converted to AUD/kWh; absent on plans that don't have that rate type (#63).
+    ("tariff_peak_rate", "Peak Rate", "AUD/kWh",
+     None, None, "mdi:cash-clock",
+     lambda d: _api_unit_rate(d, "peak"), "Tariff Rates"),
+
+    ("tariff_shoulder_rate", "Shoulder Rate", "AUD/kWh",
+     None, None, "mdi:cash-clock",
+     lambda d: _api_unit_rate(d, "shoulder"), "Tariff Rates"),
+
+    ("tariff_off_peak_rate", "Off-Peak Rate", "AUD/kWh",
+     None, None, "mdi:cash-clock",
+     lambda d: _api_unit_rate(d, "offPeak"), "Tariff Rates"),
+
+    ("tariff_ev_off_peak_rate", "EV Off-Peak Rate", "AUD/kWh",
+     None, None, "mdi:ev-station",
+     lambda d: _api_unit_rate(d, "evOffPeak"), "Tariff Rates"),
+
+    ("tariff_feed_in_rate", "Feed-in Tariff", "AUD/kWh",
+     None, None, "mdi:solar-power",
+     lambda d: _api_unit_rate(d, "feedInTariff"), "Tariff Rates"),
+
+    ("tariff_standing_charge", "Daily Supply Charge", "AUD",
+     SensorDeviceClass.MONETARY, None, "mdi:transmission-tower",
+     lambda d: _api_standing_charge(d), "Tariff Rates"),
 ]
 
-# Rate types for per-day breakdown sensors
-RATE_TYPES = ["PEAK", "SHOULDER", "OFFPEAK", "EV_OFFPEAK", "OTHER", "FREE_3"]
+# Rate types for per-day breakdown sensors: API charge type -> sensor key
+# suffix. The suffix is part of each entity's unique_id, so "OFF_PEAK" keeps
+# its historical "offpeak" suffix even though the API key has an underscore.
+RATE_TYPES = {
+    "PEAK": "peak",
+    "SHOULDER": "shoulder",
+    "OFF_PEAK": "offpeak",
+    "EV_OFFPEAK": "ev_offpeak",
+    "OTHER": "other",
+    "FREE_3": "free_3",
+}
 
 RATE_TYPE_ICONS = {
     "PEAK": "mdi:arrow-up-bold",
     "SHOULDER": "mdi:minus",
-    "OFFPEAK": "mdi:arrow-down-bold",
+    "OFF_PEAK": "mdi:arrow-down-bold",
     "EV_OFFPEAK": "mdi:ev-station",
     "FREE_3": "mdi:gift",
     "OTHER": "mdi:chart-bar",
 }
+
+
+def _product_rates(data: dict) -> dict:
+    """The first product agreement's unitRatesCentsPerKWH dict (or {})."""
+    pa = data.get("product_agreements")
+    if not isinstance(pa, dict):
+        return {}
+    agreements = pa.get("productAgreements") or []
+    if not agreements:
+        return {}
+    return (agreements[0].get("product") or {}).get("unitRatesCentsPerKWH") or {}
+
+
+def _api_unit_rate(data: dict, key: str) -> float | None:
+    """Real plan rate in AUD/kWh from the API (cents -> dollars)."""
+    cents = _product_rates(data).get(key)
+    return round(cents / 100, 4) if cents is not None else None
+
+
+def _api_standing_charge(data: dict) -> float | None:
+    """Real daily supply charge in AUD/day from the API (cents -> dollars)."""
+    pa = data.get("product_agreements")
+    if not isinstance(pa, dict):
+        return None
+    agreements = pa.get("productAgreements") or []
+    if not agreements:
+        return None
+    cents = (agreements[0].get("product") or {}).get("standingChargeCentsPerDay")
+    return round(cents / 100, 2) if cents is not None else None
 
 
 def get_rate_value(data: dict, period: str, rate_type: str, metric: str) -> float | None:

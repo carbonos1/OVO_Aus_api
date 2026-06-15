@@ -5,6 +5,85 @@ All notable changes to the OVO Energy Australia Home Assistant integration will 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.6.0] - 2026-06-14
+
+### New Features
+- **OVO Flex onboarding status** - New diagnostic sensor `flex_onboarded` ("Onboarded"/"Not Onboarded"). The field name (`flex { hasOnboarded }`) was recovered by scanning the OVO web app's bundled GraphQL operations; `hasOnboarded` is the only field the API exposes under `flex` (no balance/VPP data exists). Folded into the existing account-extras query (no extra request)
+
+### Notes
+- `GetNotificationInfo` is intentionally **not** exposed: its input requires an `fcmToken` (a mobile push-notification token) that a Home Assistant integration cannot provide. This was confirmed against the live API. The OVO GraphQL surface is now fully mapped and everything usable from a server-side integration is exposed
+
+## [4.5.0] - 2026-06-14
+
+### New Features
+- **Payment history** - New `GetAccountExtras` query exposes your payments (verified live). A `Latest Payment` sensor shows the most recent amount, with date, type (DIRECT_DEBIT / TOP_UP), payment count, and a `recent_payments` history list in its attributes
+- **Refer-a-friend earnings** - A `Referral Earnings` sensor shows your total OVO referral credit earned, with your referral code and referral count in attributes (the raf API sub-fields take a per-field `input` arg, handled in the query)
+
+### Maintenance
+- `tests/` now passes `ruff check` cleanly (removed unused imports, sorted imports, moved conftest's datetime import out of the post-mock block). No behaviour change
+
+## [4.4.0] - 2026-06-14
+
+### New Features
+- **Home Assistant Energy Dashboard support (#73)** - Three purpose-built sensors feed HA's built-in Energy Dashboard: `energy_grid_import`, `energy_grid_export`, `energy_solar_production`. They expose cumulative month-to-date totals with `state_class=total` and a monthly `last_reset` — the form the Energy Dashboard expects — so the existing point-in-time "Yesterday" sensors no longer need to be (incorrectly) used there. Add them under Settings → Energy. (OVO publishes usage ~1 day delayed, so the dashboard fills in a day behind.)
+
+## [4.3.0] - 2026-06-14
+
+### New Features
+- **Real bills (statements)** - New `GetStatements` query exposes your actual issued bills (verified against the live API). New sensors: `latest_bill_amount`, `latest_bill_closing_balance`, `latest_bill_opening_balance`, plus a `Latest Bill` sensor whose attributes include the billing period, issue date, balances, a PDF `download_url`, and a `recent_bills` list. This is real billed data, complementing the existing `bill_estimate_*` projections
+- **Real plan rates as sensors (#63)** - New `Tariff Rates` sensors surface your actual plan rates from the API (`tariff_peak_rate`, `tariff_shoulder_rate`, `tariff_off_peak_rate`, `tariff_ev_off_peak_rate`, `tariff_feed_in_rate`, `tariff_standing_charge`). The manual rate config is already auto-populated from the API at setup; these expose the live values too
+- **`Grid Consumption (Last 3 Days)` sensor** - Surfaces the previously-computed-but-unexposed `last_3_days` aggregation (orphan-namespace gap), with per-day detail in attributes
+
+### Notes
+- The hourly free/EV usage trackers (`hourly.free_usage`, `hourly.ev_usage`, `hourly.ev_usage_weekly`) are intentionally **not** exposed: the hourly API returns no rate labels, so they always compute 0 (verified). The real free/EV figures are exposed via the interval `rate_breakdown` sensors (`{period}_free_3_*`, `{period}_ev_offpeak_*`, EV charging sensors)
+
+## [4.2.2] - 2026-06-14
+
+### Bug Fixes
+- **Peak/Off-Peak TOU split now actually works on real data (#74)** - The v4.2.1 sensors read 0 in production. Verified against the live API: `GetHourlyData` returns `rates: null` and `charge: null` for every hour, so rate-less grid usage was defaulting to the `shoulder` bucket and `_split_other_by_window` (which only re-buckets `OTHER`) never matched. Rate-less hourly grid usage is now labelled `OTHER`, so the configured Free 3 peak window correctly splits it into peak/off-peak by hour. The unit tests now use realistic rate-less fixtures (matching the actual API) so this can't regress
+- **Time-of-use no longer counts solar generation** - `_compute_tou_breakdown` now only sums grid entries; solar entries were inflating the breakdown
+
+### Changed
+- **Removed `tou_peak_cost` / `tou_off_peak_cost` sensors** - The hourly API provides no per-hour cost, so these could only ever read 0. The `tou_peak_consumption` / `tou_off_peak_consumption` (kWh) sensors remain and now populate correctly for Free 3 plans with a configured peak window
+
+## [4.2.1] - 2026-06-14
+
+### Bug Fixes
+- **Peak/Off-Peak TOU sensors now exposed (#74)** - v4.2.0 computed the time-of-use peak/off-peak split (and re-bucketed `OTHER` usage into peak/off-peak for Free 3 plans) but never surfaced it as entities, so the calculated values were unreachable in Home Assistant. Four new sensors expose it: `tou_peak_consumption`, `tou_peak_cost`, `tou_off_peak_consumption`, `tou_off_peak_cost` (grouped under a "Time of Use" device, last-7-days window). They populate for Free 3 plans once the peak window is configured, and for any plan with native PEAK/OFF_PEAK rate types
+
+### Tests
+- New real-data regression tests assert the TOU value functions read the correct `hourly.time_of_use` path (75 tests total)
+
+---
+
+## [4.2.0] - 2026-06-11
+
+### New Features
+- **Free 3 Peak/Off-Peak Split (#63)** - New `peak_start_hour`/`peak_end_hour` options (shown for the Free 3 plan) re-bucket `OTHER` usage into peak/off-peak in the time-of-use breakdown. Supports overnight windows (e.g., 21 → 7); set both to the same value to disable
+
+### Bug Fixes
+- **CRITICAL: Fixed off-peak per-day rate sensors always reporting 0** - Sensors looked up `OFFPEAK` but the API charge type is `OFF_PEAK`; entity IDs are unchanged
+- **Fixed daily date bucketing using UTC dates** - Interval entries are now converted to `Australia/Sydney` before extracting the date, matching the hourly pipeline (entries near midnight no longer land on the wrong day)
+- **Fixed hourly query window using HA-local time** - The 8-day hourly fetch window now uses Sydney time, so HA instances configured in other timezones request the correct dates
+- **Fixed token-refresh loop with short-lived tokens** - The refresh buffer is now capped at half the token lifetime, preventing full re-authentication on every request
+- **Fixed reauth allowing a different OVO account** - Re-authenticating with credentials for another account now aborts with a clear error instead of silently repointing the entry
+- **Fixed rate-breakdown percentages exceeding 100%** - Percentages are recomputed after merging entries instead of being summed
+- **Fixed peak 4-hour window spanning data gaps** - Windows are now required to be 4 contiguous hours
+- **Fixed auth errors being swallowed by secondary fetches** - Authentication failures from product agreements/contact info/usage info now correctly trigger reauth
+- **Removed response body from login error messages** - Prevents any possibility of credential material reaching logs
+- **Day-rate sensors now report unavailable (not 0) when history is missing**
+- **EV charging monthly/yearly kWh sensors now use TOTAL_INCREASING** - Correct statistics at month/year rollover
+- **Annual savings projection skips the first 2 days of a month** - Avoids wildly unstable extrapolations
+
+### Improvements
+- README/info.md now warn against selecting HA's built-in **OVO Energy** (UK) integration (#72) and the quick-example entity IDs were corrected
+- Multi-account holders get a logged warning that the first account is used
+- Analytics now use a single mockable clock source (`dt_util.now(AU_TIMEZONE)`), making the test suite deterministic year-round
+- `tzdata` added to dev dependencies so tests run on Windows/slim containers
+- New tests: peak window splitting, PlanConfig window round-trip (72 tests total)
+
+---
+
 ## [4.1.1] - 2026-04-22
 
 ### Bug Fixes
@@ -13,8 +92,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **#54** - Fixed `DASHBOARD_GUIDE.md` sensor references missing the `ovo_energy_au_` entity prefix (e.g., `sensor.daily_solar_consumption` → `sensor.ovo_energy_au_daily_solar_consumption`). All daily/monthly/yearly/hourly references corrected.
 - **#58** - Bumped manifest version to 4.1.1 so HACS displays the semantic version. Note: a matching `v4.1.1` GitHub release/tag must be created for HACS to resolve the version correctly.
 
-### Known Issues
-- **#63** (feature request) - Manual peak/off-peak window config for the `OTHER` charge bucket on the 3 Free TOU plan is planned for a future release.
+---
 
 ## [4.1.0] - 2026-03-21
 

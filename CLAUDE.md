@@ -72,3 +72,42 @@ mypy custom_components/ovo_energy_au/
 4. POST form_action -> follow redirects -> extract authorization code
 5. POST /oauth/token -> exchange code for access/id/refresh tokens
 6. Proactive refresh at 80% of token lifetime
+
+## Release Process (MANDATORY — HACS only distributes tagged releases)
+HACS resolves the installable version from the **latest GitHub release tag**, not
+from main. A version bump without a release is invisible to users. Whenever the
+version changes, ALWAYS do all of the following in the same session:
+
+1. Bump the version in **four** places (they must agree):
+   - `custom_components/ovo_energy_au/manifest.json` ("version")
+   - `pyproject.toml` ([project] version)
+   - `README.md` version badge
+   - `info.md` version badge
+2. Add a `CHANGELOG.md` entry for the new version (Keep a Changelog format)
+3. Run `git fetch origin` and rebase before committing — remote main moves via
+   cloud-agent PRs between local sessions
+4. Commit and push to main
+5. Create the GitHub release: `gh release create vX.Y.Z --target main --title "vX.Y.Z" --notes-file <notes>`
+   - Release notes start with the referral support block (see release.yml for the template),
+     then the changelog highlights
+   - Tag format is `v` + semver (e.g. `v4.2.0`)
+6. Attach the manual-install zip, then `gh release upload vX.Y.Z ovo_energy_au.zip`
+   - Do NOT use PowerShell `Compress-Archive` on Windows PowerShell 5.1: it writes
+     entry paths with backslashes (`ovo_energy_au\sensors\definitions.py`), which
+     extract as one mangled filename on Linux/macOS where most HA users run — a
+     broken zip. Build it with forward-slash paths (and skip `__pycache__`/`.pyc`):
+     ```bash
+     python -c "import zipfile,os; z=zipfile.ZipFile('ovo_energy_au.zip','w',zipfile.ZIP_DEFLATED); [z.write(os.path.join(dp,f), os.path.relpath(os.path.join(dp,f),'custom_components').replace(os.sep,'/')) for dp,ds,fs in os.walk('custom_components/ovo_energy_au') if (ds.__setitem__(slice(None),[d for d in ds if d!='__pycache__']) or True) for f in fs if not f.endswith('.pyc')]; z.close()"
+     ```
+   - After upload, verify the asset has forward-slash entries and contains your change.
+   - The `release.yml` workflow normally does steps 5-6 on tag push (using `zip -r`,
+     which is correct), but do it manually whenever GitHub Actions is unavailable
+     (e.g. billing lock — `gh run view` shows "account is locked due to a billing issue")
+7. Verify: `gh release list` must show the new tag as **Latest**
+
+## Branding (logos/icons in HA and HACS)
+HA and HACS load icons exclusively from https://github.com/home-assistant/brands
+(`custom_integrations/ovo_energy_au/`), NOT from this repo. The PNGs in this repo
+(`icon.png`, `icon@2x.png`, `brand/`) are only sources for that PR. If the icon
+ever changes, a new PR to home-assistant/brands is required (icon.png must be
+exactly 256x256, icon@2x.png 512x512, transparent background, trimmed).

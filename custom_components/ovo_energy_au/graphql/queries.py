@@ -179,3 +179,57 @@ query GetProductAgreements($input: GetAccountInfoInput!) {
   }
 }
 """
+
+GET_STATEMENTS = """
+query GetStatements($input: GetAccountInfoInput!) {
+  GetAccountInfo(input: $input) {
+    id
+    statements {
+      id
+      periodFrom
+      periodTo
+      issueDate
+      openingBalance {
+        value
+        type
+      }
+      closingBalance {
+        value
+        type
+      }
+      charges {
+        total {
+          value
+          type
+        }
+      }
+      downloadUrl
+    }
+  }
+}
+"""
+
+# Payments + refer-a-friend. NOTE: raf sub-fields each take their own required
+# `input` arg (unusual), so $input is reused on referralCode/totalEarned/referrals.
+GET_ACCOUNT_EXTRAS = """
+query GetAccountExtras($input: GetAccountInfoInput!) {
+  GetAccountInfo(input: $input) {
+    id
+    flex {
+      hasOnboarded
+    }
+    payments {
+      amount
+      date
+      type
+    }
+    raf {
+      referralCode(input: $input)
+      totalEarned(input: $input)
+      referrals(input: $input) {
+        status
+      }
+    }
+  }
+}
+"""
