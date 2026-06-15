@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import date, timedelta
 
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
@@ -13,9 +13,13 @@ from homeassistant.helpers.update_coordinator import (
 )
 from homeassistant.util import dt as dt_util
 
-from .analytics.hourly import process_hourly_data
+from .analytics.hourly import (
+    aggregate_hourly_to_daily,
+    process_hourly_data,
+    prune_hourly_raw_data,
+)
 from .analytics.insights import compute_insights
-from .analytics.interval import process_interval_data
+from .analytics.interval import process_interval_data, recompute_aggregations
 from .api import (
     OVOEnergyAUApiClient,
     OVOEnergyAUApiClientAuthenticationError,
@@ -50,6 +54,46 @@ class OVOEnergyAUDataUpdateCoordinator(TimestampDataUpdateCoordinator):
             update_interval=FAST_UPDATE_INTERVAL,
         )
 
+    async def _backfill_missing_days(self, processed: dict, now_date: date) -> None:
+        """Detect missing daily interval entries and backfill from hourly data."""
+        missing = processed.get("missing_daily_dates", [])
+        if not missing:
+            return
+
+        cutoff = now_date - timedelta(days=8)
+        backfilled = False
+
+        for date_str in missing:
+            try:
+                target = date.fromisoformat(date_str)
+            except ValueError:
+                continue
+
+            # Only backfill recent days where we actually fetched hourly data.
+            if target < cutoff:
+                _LOGGER.debug("Skipping backfill for %s: outside hourly window", date_str)
+                continue
+
+            try:
+                hourly_raw = await self.client.get_hourly_data_for_date(
+                    self.account_id, date_str
+                )
+                synthetic = aggregate_hourly_to_daily(
+                    process_hourly_data(hourly_raw or {}, self.plan_config),
+                    target,
+                )
+                if synthetic:
+                    processed["all_daily_entries"].append(synthetic)
+                    backfilled = True
+            except Exception as err:
+                _LOGGER.debug("Could not backfill %s: %s", date_str, err)
+
+        if backfilled:
+            processed["all_daily_entries"].sort(
+                key=lambda x: x["date"], reverse=True
+            )
+            recompute_aggregations(processed, dt_util.now())
+
     async def _async_update_data(self) -> dict:
         """Fetch data from OVO Energy API."""
         try:
@@ -69,24 +113,33 @@ class OVOEnergyAUDataUpdateCoordinator(TimestampDataUpdateCoordinator):
             # 3. Hourly data - fetch last 8 days to cover all 7-day-ago sensors
             # and handle month boundaries (e.g., yesterday on the 1st)
             now = dt_util.now()
+            now_date = now.date()
             query_start = (now - timedelta(days=8)).strftime("%Y-%m-%d")
             query_end = now.strftime("%Y-%m-%d")
+
+            previous_hourly = (self.data or {}).get("hourly", {}) if self.data else {}
 
             try:
                 hourly_raw = await self.client.get_hourly_data(
                     self.account_id, query_start, query_end
                 )
+                pruned_raw = prune_hourly_raw_data(
+                    hourly_raw or {}, now_date - timedelta(days=8)
+                )
                 processed["hourly"] = process_hourly_data(
-                    hourly_raw or {}, self.plan_config
+                    pruned_raw or {}, self.plan_config
                 )
             except Exception as err:
                 _LOGGER.warning("Failed to fetch hourly data: %s", err)
-                processed["hourly"] = process_hourly_data({}, self.plan_config)
+                processed["hourly"] = previous_hourly
 
-            # 4. Analytics insights
+            # 4. Backfill missing daily entries from hourly data
+            await self._backfill_missing_days(processed, now_date)
+
+            # 5. Analytics insights (after backfill so they include synthetic days)
             compute_insights(processed)
 
-            # 4b. Calculate bill estimate
+            # 6. Calculate bill estimate
             try:
                 # Get standing charge from product agreements
                 standing_daily = 0
@@ -136,7 +189,7 @@ class OVOEnergyAUDataUpdateCoordinator(TimestampDataUpdateCoordinator):
                 _LOGGER.debug("Failed to calculate bill estimate: %s", err)
                 processed["bill_estimate"] = {}
 
-            # 5. Account balance from contact info
+            # 7. Account balance from contact info
             try:
                 contact_info = await self.client.get_contact_info()
                 accounts = contact_info.get("accounts", [])
@@ -149,7 +202,7 @@ class OVOEnergyAUDataUpdateCoordinator(TimestampDataUpdateCoordinator):
                 processed["account_balance"] = None
                 processed["has_solar"] = None
 
-            # 6. Usage info (timezone, meter type)
+            # 8. Usage info (timezone, meter type)
             try:
                 usage_info = await self.client.get_usage_info(self.account_id)
                 usage_v2 = (usage_info or {}).get("usageV2") or {}

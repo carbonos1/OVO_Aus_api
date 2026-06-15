@@ -311,7 +311,12 @@ class OVORateBreakdownSensor(OVOBaseSensor):
 
 
 class OVODaySensor(OVOBaseSensor):
-    """Dynamic day sensor for last 7 days."""
+    """Dynamic day sensor for last 7 days.
+
+    Each sensor is bound to an absolute calendar date (N days ago) rather than
+    a positional index into all_daily_entries. This keeps Day N pointing at the
+    correct date even when OVO skips days in the interval response.
+    """
 
     def __init__(self, coordinator, key, name, unit, device_class, state_class, icon, day_index, value_key):
         super().__init__(coordinator, key, name, "Daily History")
@@ -322,28 +327,37 @@ class OVODaySensor(OVOBaseSensor):
         self._day_index = day_index
         self._value_key = value_key
 
+    def _get_target_date(self):
+        """Return the absolute calendar date this sensor represents."""
+        return (datetime.now(AU_TIMEZONE) - timedelta(days=self._day_index + 1)).date()
+
+    def _find_day_entry(self):
+        """Return the daily entry matching the target date, if any."""
+        if not self.coordinator.data:
+            return None
+        target = self._get_target_date().isoformat()
+        for day in self.coordinator.data.get("all_daily_entries", []):
+            if day.get("date") == target:
+                return day
+        return None
+
     @property
     def name(self) -> str:
-        if not self.coordinator.data:
-            return self._sensor_name
-        all_daily = self.coordinator.data.get("all_daily_entries", [])
-        if self._day_index < len(all_daily):
-            d = all_daily[self._day_index]
-            label = _format_date_label(d.get("date", ""))
-            day_name = d.get("day_name", "")
+        day = self._find_day_entry()
+        if day:
+            label = _format_date_label(day.get("date", ""))
+            day_name = day.get("day_name", "")
             if day_name:
                 return f"{day_name} {label.split(' ', 1)[1] if ' ' in label else label}"
         return self._sensor_name
 
     @property
     def native_value(self) -> float | None:
-        if not self.coordinator.data:
+        day = self._find_day_entry()
+        if day is None:
             return None
-        all_daily = self.coordinator.data.get("all_daily_entries", [])
-        if self._day_index < len(all_daily):
-            value = all_daily[self._day_index].get(self._value_key, 0)
-            return round(float(value), 2) if value is not None else None
-        return None
+        value = day.get(self._value_key, 0)
+        return round(float(value), 2) if value is not None else None
 
     @property
     def native_unit_of_measurement(self): return self._unit
@@ -356,7 +370,7 @@ class OVODaySensor(OVOBaseSensor):
 
 
 class OVODayRateSensor(OVOBaseSensor):
-    """Per-rate sensor for a specific day."""
+    """Per-rate sensor for a specific absolute day."""
 
     def __init__(self, coordinator, key, name, unit, device_class, state_class, icon, day_index, rate_type, metric_key):
         super().__init__(coordinator, key, name, "Daily History")
@@ -368,14 +382,25 @@ class OVODayRateSensor(OVOBaseSensor):
         self._rate_type = rate_type
         self._metric_key = metric_key
 
-    @property
-    def native_value(self) -> float | None:
+    def _get_target_date(self):
+        """Return the absolute calendar date this sensor represents."""
+        return (datetime.now(AU_TIMEZONE) - timedelta(days=self._day_index + 1)).date()
+
+    def _find_day_entry(self):
+        """Return the daily entry matching the target date, if any."""
         if not self.coordinator.data:
             return None
-        all_daily = self.coordinator.data.get("all_daily_entries", [])
-        if self._day_index >= len(all_daily):
-            return 0
-        day_data = all_daily[self._day_index]
+        target = self._get_target_date().isoformat()
+        for day in self.coordinator.data.get("all_daily_entries", []):
+            if day.get("date") == target:
+                return day
+        return None
+
+    @property
+    def native_value(self) -> float | None:
+        day_data = self._find_day_entry()
+        if day_data is None:
+            return None
         if self._rate_type == "FREE_3" and self._metric_key == "grid_rates_aud":
             return self._free3_savings(day_data)
         return round(float(day_data.get(self._metric_key, {}).get(self._rate_type, 0)), 2)
@@ -400,7 +425,11 @@ class OVODayRateSensor(OVOBaseSensor):
 
 
 class OVODailyHistorySensor(OVOBaseSensor):
-    """History sensor showing a day's consumption by rate type."""
+    """History sensor showing a day's consumption by rate type.
+
+    Bound to an absolute calendar date so missing days in the OVO response do
+    not shift the Day N labels onto the wrong dates.
+    """
 
     def __init__(self, coordinator, key, name, day_index, rate_type, icon):
         super().__init__(coordinator, key, name, "Daily History")
@@ -411,14 +440,25 @@ class OVODailyHistorySensor(OVOBaseSensor):
         self._attr_device_class = SensorDeviceClass.ENERGY
         self._attr_state_class = SensorStateClass.TOTAL
 
-    @property
-    def native_value(self) -> float | None:
+    def _get_target_date(self):
+        """Return the absolute calendar date this sensor represents."""
+        return (datetime.now(AU_TIMEZONE) - timedelta(days=self._day_index + 1)).date()
+
+    def _find_day_entry(self):
+        """Return the daily entry matching the target date, if any."""
         if not self.coordinator.data:
             return None
-        all_daily = self.coordinator.data.get("all_daily_entries", [])
-        if self._day_index >= len(all_daily):
+        target = self._get_target_date().isoformat()
+        for day in self.coordinator.data.get("all_daily_entries", []):
+            if day.get("date") == target:
+                return day
+        return None
+
+    @property
+    def native_value(self) -> float | None:
+        day = self._find_day_entry()
+        if day is None:
             return None
-        day = all_daily[self._day_index]
         if self._rate_type is None:
             return round(day.get("grid_consumption", 0) + day.get("solar_consumption", 0), 2)
         return round(day.get("grid_rates_kwh", {}).get(self._rate_type, 0), 2)
@@ -428,12 +468,9 @@ class OVODailyHistorySensor(OVOBaseSensor):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        if not self.coordinator.data:
+        day = self._find_day_entry()
+        if day is None:
             return {}
-        all_daily = self.coordinator.data.get("all_daily_entries", [])
-        if self._day_index >= len(all_daily):
-            return {}
-        day = all_daily[self._day_index]
         attrs = {
             "date": day.get("date"),
             "day_name": day.get("day_name"),
@@ -558,15 +595,26 @@ class OVOHealthSensor(OVOBaseSensor):
             attrs["daily_entries_available"] = len(all_daily)
             attrs["hourly_solar_entries"] = len(hourly.get("solar_entries", []))
             attrs["hourly_grid_entries"] = len(hourly.get("grid_entries", []))
+            attrs["hourly_entries_days"] = len({
+                entry.get("periodFrom", "")[:10]
+                for entry in (
+                    hourly.get("solar_entries", [])
+                    + hourly.get("grid_entries", [])
+                    + hourly.get("return_to_grid_entries", [])
+                )
+                if entry.get("periodFrom")
+            })
             attrs["has_product_agreements"] = self.coordinator.data.get("product_agreements") is not None
             attrs["has_solar"] = self.coordinator.data.get("has_solar")
             attrs["meter_type"] = self.coordinator.data.get("meter_type")
             attrs["api_timezone"] = self.coordinator.data.get("api_timezone")
             attrs["last_meter_read"] = self.coordinator.data.get("last_meter_read")
-
-            if all_daily:
-                attrs["oldest_daily_date"] = all_daily[-1].get("date")
-                attrs["newest_daily_date"] = all_daily[0].get("date")
+            attrs["missing_daily_dates"] = self.coordinator.data.get("missing_daily_dates", [])
+            attrs["newest_daily_date"] = self.coordinator.data.get("newest_daily_date")
+            attrs["oldest_daily_date"] = self.coordinator.data.get("oldest_daily_date")
+            attrs["synthetic_entries_count"] = sum(
+                1 for d in all_daily if d.get("synthetic")
+            )
 
         if self.coordinator.last_update_success_time:
             attrs["last_successful_update"] = self.coordinator.last_update_success_time.isoformat()

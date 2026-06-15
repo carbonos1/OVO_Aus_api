@@ -33,6 +33,7 @@ class DailyEntry(TypedDict, total=False):
     periodTo: str
     grid_rates_kwh: dict[str, float]
     grid_rates_aud: dict[str, float]
+    synthetic: bool
 
 
 class PeriodData(TypedDict, total=False):

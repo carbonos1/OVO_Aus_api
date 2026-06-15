@@ -576,6 +576,12 @@ class OVOEnergyAUApiClient:
             allow_null_result=True,
         )
 
+    async def get_hourly_data_for_date(
+        self, account_id: str, target_date: str
+    ) -> dict[str, Any]:
+        """Convenience wrapper to fetch hourly data for a single date."""
+        return await self.get_hourly_data(account_id, target_date, target_date)
+
     async def get_product_agreements(self, account_id: str) -> dict[str, Any]:
         """Get product agreements (plan information) for an account."""
         result = await self._graphql_request(

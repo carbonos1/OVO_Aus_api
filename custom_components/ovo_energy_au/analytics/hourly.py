@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from typing import Any
 
 from homeassistant.util import dt as dt_util
 
@@ -33,7 +34,7 @@ def process_hourly_data(data: dict | None, plan_config: PlanConfig) -> dict:
     if data is None:
         data = {}
 
-    processed = {
+    processed: dict[str, Any] = {
         "solar_entries": [],
         "grid_entries": [],
         "return_to_grid_entries": [],
@@ -100,6 +101,118 @@ def process_hourly_data(data: dict | None, plan_config: PlanConfig) -> dict:
     processed["peak_4hour_window"] = _find_peak_window(timeline)
 
     return processed
+
+
+def prune_hourly_raw_data(raw_data: dict | None, cutoff_date: date) -> dict:
+    """Drop hourly entries older than cutoff_date to limit memory use."""
+    if not raw_data:
+        return {}
+
+    def _keep(entry: dict) -> bool:
+        ts = _parse_timestamp(entry.get("periodFrom", ""))
+        return ts is not None and ts.date() >= cutoff_date
+
+    return {
+        "solar": [_keep(e) and e for e in (raw_data.get("solar") or []) if _keep(e)],
+        "export": [_keep(e) and e for e in (raw_data.get("export") or []) if _keep(e)],
+    }
+
+
+def _new_daily_entry(target_date: date) -> dict:
+    """Create a fresh daily entry for a synthetic backfill."""
+    return {
+        "date": target_date.isoformat(),
+        "day_name": target_date.strftime("%A"),
+        "day": target_date.day,
+        "month": target_date.month,
+        "year": target_date.year,
+        "solar_consumption": 0,
+        "solar_charge": 0,
+        "grid_consumption": 0,
+        "grid_charge": 0,
+        "return_to_grid": 0,
+        "return_to_grid_charge": 0,
+        "grid_rates_kwh": {},
+        "grid_rates_aud": {},
+    }
+
+
+def aggregate_hourly_to_daily(hourly_data: dict, target_date: date) -> dict | None:
+    """Return a synthetic daily entry for target_date from hourly entries."""
+    if not hourly_data:
+        return None
+
+    daily = _new_daily_entry(target_date)
+    matched = False
+
+    for entry in hourly_data.get("grid_entries", []):
+        ts = _parse_timestamp(entry.get("periodFrom", ""))
+        if ts is None or ts.date() != target_date:
+            continue
+        matched = True
+
+        consumption = entry.get("consumption", 0) or 0
+        charge = entry.get("charge") or {}
+        charge_value = charge.get("value", 0) if isinstance(charge, dict) else 0
+        charge_type = charge.get("type", "DEBIT") if isinstance(charge, dict) else "DEBIT"
+
+        daily["grid_consumption"] += consumption
+        daily["grid_charge"] += charge_value
+
+        rates = entry.get("rates") or []
+        if rates and isinstance(rates, list):
+            for rate_entry in rates:
+                if not isinstance(rate_entry, dict):
+                    continue
+                rate_type = rate_entry.get("type")
+                if not rate_type:
+                    continue
+                rate_consumption = rate_entry.get("consumption", 0) or 0
+                rate_charge_obj = rate_entry.get("charge") or {}
+                rate_charge = rate_charge_obj.get("value", 0) if isinstance(rate_charge_obj, dict) else 0
+
+                daily["grid_rates_kwh"][rate_type] = (
+                    daily["grid_rates_kwh"].get(rate_type, 0) + rate_consumption
+                )
+                daily["grid_rates_aud"][rate_type] = (
+                    daily["grid_rates_aud"].get(rate_type, 0) + abs(rate_charge)
+                )
+        else:
+            rate_type = charge_type if charge_type in _CHARGE_TYPE_TO_PERIOD else "OTHER"
+            daily["grid_rates_kwh"][rate_type] = daily["grid_rates_kwh"].get(rate_type, 0) + consumption
+            daily["grid_rates_aud"][rate_type] = daily["grid_rates_aud"].get(rate_type, 0) + abs(charge_value)
+
+    for entry in hourly_data.get("return_to_grid_entries", []):
+        ts = _parse_timestamp(entry.get("periodFrom", ""))
+        if ts is None or ts.date() != target_date:
+            continue
+        matched = True
+
+        consumption = entry.get("consumption", 0) or 0
+        charge = entry.get("charge") or {}
+        charge_value = charge.get("value", 0) if isinstance(charge, dict) else 0
+
+        daily["return_to_grid"] += consumption
+        daily["return_to_grid_charge"] += charge_value
+
+    for entry in hourly_data.get("solar_entries", []):
+        ts = _parse_timestamp(entry.get("periodFrom", ""))
+        if ts is None or ts.date() != target_date:
+            continue
+        matched = True
+
+        consumption = entry.get("consumption", 0) or 0
+        charge = entry.get("charge") or {}
+        charge_value = charge.get("value", 0) if isinstance(charge, dict) else 0
+
+        daily["solar_consumption"] += consumption
+        daily["solar_charge"] += charge_value
+
+    if not matched:
+        return None
+
+    daily["synthetic"] = True
+    return daily
 
 
 def _aggregate_hourly_rates(grid_entries: list[dict]) -> dict:
@@ -305,7 +418,7 @@ def _add_usage_tracking(
 def _compute_heatmap(timeline: list[dict]) -> dict:
     """Compute day-of-week x hour average consumption heatmap."""
     # First aggregate consumption per unique (date, hour) to avoid double-counting (Bug 3 fix)
-    hour_totals = {}  # {(date_str, hour): consumption}
+    hour_totals: dict[tuple[str, int], float] = {}
     for entry in timeline:
         ts = entry["timestamp"]
         date_str = ts.strftime("%Y-%m-%d")
@@ -314,7 +427,7 @@ def _compute_heatmap(timeline: list[dict]) -> dict:
         hour_totals[key] = hour_totals.get(key, 0) + entry["consumption"]
 
     # Now build day-of-week averages from deduplicated hourly totals
-    buckets = {}  # {day_name: {hour: {total, count}}}
+    buckets: dict[str, dict[int, dict[str, float | int]]] = {}
     for (date_str, hour), consumption in hour_totals.items():
         day_name = datetime.strptime(date_str, "%Y-%m-%d").strftime("%A")
         if day_name not in buckets:

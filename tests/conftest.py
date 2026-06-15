@@ -21,7 +21,9 @@ sys.modules.setdefault("homeassistant.helpers.aiohttp_client", ha_mock)
 class _CoordinatorEntity:
     """Stub for homeassistant.helpers.update_coordinator.CoordinatorEntity."""
     def __init__(self, *args, **kwargs):
-        pass
+        # Match HA behaviour: the first positional arg is the coordinator.
+        if args:
+            self.coordinator = args[0]
 
 class _SensorEntity:
     """Stub for homeassistant.components.sensor.SensorEntity."""

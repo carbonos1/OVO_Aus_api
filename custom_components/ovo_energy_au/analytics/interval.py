@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from typing import Any
 
 from homeassistant.util import dt as dt_util
 
@@ -29,7 +30,7 @@ def process_interval_data(data: dict) -> dict:
     - monthly: individual month entries (latest = current month)
     - yearly: individual year entries (latest = current year)
     """
-    processed = {
+    processed: dict[str, Any] = {
         "daily": {},
         "monthly": {},
         "yearly": {},
@@ -70,6 +71,15 @@ def process_interval_data(data: dict) -> dict:
         all_daily_entries = sorted(daily_map.values(), key=lambda x: x["date"], reverse=True)[:90]
         processed["all_daily_entries"] = all_daily_entries
 
+        if all_daily_entries:
+            processed["newest_daily_date"] = all_daily_entries[0]["date"]
+            processed["oldest_daily_date"] = all_daily_entries[-1]["date"]
+            processed["missing_daily_dates"] = _find_missing_dates(all_daily_entries)
+        else:
+            processed["newest_daily_date"] = None
+            processed["oldest_daily_date"] = None
+            processed["missing_daily_dates"] = []
+
         now = dt_util.now()
         _add_aggregations(processed, all_daily_entries, now)
         _add_monthly_breakdowns(processed, daily_data, now)
@@ -91,6 +101,46 @@ def _empty_all_time() -> dict:
         "periodTo": None,
         "months_included": 0,
     }
+
+
+def _date_range_inclusive(start: date, end: date):
+    """Yield dates from start to end inclusive."""
+    for offset in range((end - start).days + 1):
+        yield start + timedelta(days=offset)
+
+
+def _find_missing_dates(all_daily: list[dict]) -> list[str]:
+    """Return ISO dates missing from the contiguous daily range."""
+    if not all_daily:
+        return []
+
+    try:
+        newest = date.fromisoformat(all_daily[0]["date"])
+        oldest = date.fromisoformat(all_daily[-1]["date"])
+    except (ValueError, TypeError):
+        return []
+
+    existing = {entry.get("date") for entry in all_daily}
+    return [
+        d.isoformat()
+        for d in _date_range_inclusive(oldest, newest)
+        if d.isoformat() not in existing
+    ]
+
+
+def recompute_aggregations(processed: dict, now) -> None:
+    """Recompute aggregations and monthly breakdowns after backfill.
+
+    Should be called whenever all_daily_entries is mutated (e.g. synthetic
+    backfill) so that month-to-date, last 7 days, and dashboard breakdowns
+    reflect the corrected data.
+    """
+    all_daily = processed.get("all_daily_entries", [])
+    if not all_daily:
+        return
+
+    _add_aggregations(processed, all_daily, now)
+    _rebuild_monthly_breakdowns(processed, all_daily, now)
 
 
 def _process_period_latest(period: str, period_data: dict) -> dict:
@@ -362,6 +412,73 @@ def _add_monthly_breakdowns(processed: dict, daily_data: dict, now) -> None:
                     grid_breakdown.append(daily_entry)
         except (ValueError, TypeError):
             continue
+
+    processed["monthly"]["solar_daily_breakdown"] = sorted(solar_breakdown, key=lambda x: x["date"])
+    processed["monthly"]["grid_daily_breakdown"] = sorted(grid_breakdown, key=lambda x: x["date"])
+    processed["monthly"]["return_daily_breakdown"] = sorted(return_breakdown, key=lambda x: x["date"])
+
+    if solar_breakdown:
+        processed["monthly"]["solar_daily_avg"] = round(
+            sum(d["consumption"] for d in solar_breakdown) / len(solar_breakdown), 2
+        )
+        processed["monthly"]["solar_daily_max"] = round(
+            max(d["consumption"] for d in solar_breakdown), 2
+        )
+        processed["monthly"]["solar_charge_daily_avg"] = round(
+            sum(d["charge"] for d in solar_breakdown) / len(solar_breakdown), 2
+        )
+
+
+def _rebuild_monthly_breakdowns(processed: dict, all_daily: list[dict], now) -> None:
+    """Rebuild current-month daily breakdowns from all_daily_entries.
+
+    This is used after synthetic backfill so the dashboard's monthly bars
+    include every calendar day, not only the days OVO returned in the raw
+    interval response.
+    """
+    current_month = now.month
+    current_year = now.year
+
+    solar_breakdown = []
+    grid_breakdown = []
+    return_breakdown = []
+
+    for day in all_daily:
+        if day.get("month") != current_month or day.get("year") != current_year:
+            continue
+
+        is_synthetic = day.get("synthetic", False)
+        date_str = day.get("date", "")
+        day_num = day.get("day")
+
+        if day.get("solar_consumption", 0) or is_synthetic:
+            solar_breakdown.append({
+                "date": date_str,
+                "day": day_num,
+                "consumption": day.get("solar_consumption", 0),
+                "charge": day.get("solar_charge", 0),
+                "read_type": "SYNTHETIC" if is_synthetic else "ACTUAL",
+            })
+
+        if day.get("grid_consumption", 0) or is_synthetic:
+            grid_breakdown.append({
+                "date": date_str,
+                "day": day_num,
+                "consumption": day.get("grid_consumption", 0),
+                "charge": day.get("grid_charge", 0),
+                "read_type": "SYNTHETIC" if is_synthetic else "ACTUAL",
+                "charge_type": "DEBIT",
+            })
+
+        if day.get("return_to_grid", 0) or is_synthetic:
+            return_breakdown.append({
+                "date": date_str,
+                "day": day_num,
+                "consumption": day.get("return_to_grid", 0),
+                "charge": day.get("return_to_grid_charge", 0),
+                "read_type": "SYNTHETIC" if is_synthetic else "ACTUAL",
+                "charge_type": "CREDIT",
+            })
 
     processed["monthly"]["solar_daily_breakdown"] = sorted(solar_breakdown, key=lambda x: x["date"])
     processed["monthly"]["grid_daily_breakdown"] = sorted(grid_breakdown, key=lambda x: x["date"])
